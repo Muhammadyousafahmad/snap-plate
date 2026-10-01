@@ -4,8 +4,8 @@
 
 project_id = "zkfqjxctzfgyzrexarbg"
 
-# JWT verification is enforced — the mobile client must send the Supabase
-# anon key in the `apikey` header. This blocks unauthenticated API abuse
-# at the gateway layer before the function code is reached.
+# JWT verification is enforced — the mobile client sends its anon key in the
+# `apikey` header and the signed-in user's access token in `Authorization`.
+# The gateway resolves the `authenticated` role before the function runs.
 [functions.analyze-meal]
 verify_jwt = true

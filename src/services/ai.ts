@@ -1,6 +1,8 @@
 import Constants from 'expo-constants';
 import { manipulateAsync, SaveFormat } from 'expo-image-manipulator';
 
+import { getSupabase } from '@/services/supabase';
+
 /**
  * ==== SnapPlate AI service layer ====
  * Analyzes a food photo and returns estimated macros.
@@ -155,6 +157,23 @@ async function prepareImage(uri: string): Promise<PreparedImage> {
   return { base64: result.base64 };
 }
 
+/**
+ * Returns the signed-in user's Supabase access token (a short-lived JWT), or
+ * undefined when there is no session. The `analyze-meal` Edge Function runs with
+ * `verify_jwt = true`, so this token — not the public anon key — belongs in the
+ * `Authorization` header.
+ */
+async function getUserAccessToken(): Promise<string | undefined> {
+  try {
+    const { data, error } = await getSupabase().auth.getSession();
+    if (error) return undefined;
+    return data.session?.access_token;
+  } catch {
+    // Supabase is unconfigured (missing env vars) or storage is unavailable.
+    return undefined;
+  }
+}
+
 async function analyzeWithBackend(base64: string): Promise<NutritionResult> {
   const endpoint = resolveApiUrl();
   if (!endpoint) {
@@ -162,6 +181,8 @@ async function analyzeWithBackend(base64: string): Promise<NutritionResult> {
   }
 
   const anonKey = process.env.EXPO_PUBLIC_SUPABASE_ANON_KEY?.trim();
+  // Prefer the signed-in user's JWT; the anon key is only a signed-out fallback.
+  const authToken = (await getUserAccessToken()) ?? anonKey;
 
   let response: Response;
   try {
@@ -169,9 +190,14 @@ async function analyzeWithBackend(base64: string): Promise<NutritionResult> {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
-        // Required when verify_jwt = true in supabase/config.toml.
-        // The anon key is public-safe: it carries no elevated privileges.
-        ...(anonKey ? { apikey: anonKey, Authorization: `Bearer ${anonKey}` } : {}),
+        // The public anon key identifies the project at the Supabase gateway
+        // (required when verify_jwt = true in supabase/config.toml).
+        ...(anonKey ? { apikey: anonKey } : {}),
+        // The gateway reads the signed-in user's JWT from Authorization, so it
+        // resolves the `authenticated` role instead of `anon` and the function
+        // sees the real user (auth.uid()). The anon key is only used when there
+        // is no session to fall back to.
+        ...(authToken ? { Authorization: `Bearer ${authToken}` } : {}),
       },
       body: JSON.stringify({ image_base64: base64, mime_type: 'image/jpeg' }),
     });

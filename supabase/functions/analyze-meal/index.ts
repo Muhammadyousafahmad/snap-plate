@@ -3,35 +3,133 @@
  */
 
 import { ApiError, type FdcNutrients, type GeminiItem, type NutritionResult, type ResolvedItem } from './types.ts';
+import { authenticateRequest } from './auth.ts';
 import { identifyFoodItems } from './gemini.ts';
 import { lookupNutrition } from './usda.ts';
 
 const MAX_IMAGE_BYTES = 12 * 1024 * 1024; // the client compresses to ~1 MB; 12 MB is a hard ceiling
 
-const corsHeaders = {
-  'Access-Control-Allow-Origin': '*',
-  'Access-Control-Allow-Headers': 'authorization, x-client-info, apikey, content-type',
-  'Access-Control-Allow-Methods': 'POST, GET, OPTIONS',
-};
+// ── CORS ─────────────────────────────────────────────────────────────────────
+// Reflect only an Origin that is explicitly allowed instead of answering every
+// caller with `Access-Control-Allow-Origin: *`. Native (Expo) requests send no
+// Origin header and are unaffected; this keeps the response readable only to the
+// deployed web build. Configure the web app's origin(s) with the comma-separated
+// ALLOWED_ORIGINS secret — the defaults cover local Expo web during development.
+const DEFAULT_ALLOWED_ORIGINS = ['http://localhost:8081', 'http://localhost:19006'];
+const CONFIGURED_ALLOWED_ORIGINS = (Deno.env.get('ALLOWED_ORIGINS') ?? '')
+  .split(',')
+  .map((origin) => origin.trim())
+  .filter((origin) => origin.length > 0);
+const ALLOWED_ORIGINS =
+  CONFIGURED_ALLOWED_ORIGINS.length > 0 ? CONFIGURED_ALLOWED_ORIGINS : DEFAULT_ALLOWED_ORIGINS;
 
-// ── In-memory IP rate limiter (token-bucket, 10 req / 60 s) ─────────────────
-// Per-instance only — does not coordinate across Edge Function replicas.
-// Acts as a first line of defense against rapid single-client abuse.
-const RATE_LIMIT_MAX = 10;       // max requests per window
+/**
+ * CORS headers for one request. `Access-Control-Allow-Origin` is added only when
+ * the request's Origin is on the allowlist, so an unlisted browser origin is not
+ * granted read access. `Vary: Origin` keeps caches from mixing the responses.
+ */
+function corsHeadersFor(req: Request): Record<string, string> {
+  const headers: Record<string, string> = {
+    'Access-Control-Allow-Headers': 'authorization, x-client-info, apikey, content-type',
+    'Access-Control-Allow-Methods': 'POST, GET, OPTIONS',
+    Vary: 'Origin',
+  };
+  const origin = req.headers.get('origin');
+  if (origin && ALLOWED_ORIGINS.includes(origin)) {
+    headers['Access-Control-Allow-Origin'] = origin;
+  }
+  return headers;
+}
+
+// ── Rate limiting (10 requests / 60 s per client) ───────────────────────────
+// Primary limiter: the `check_rate_limit` Postgres function (see the migrations)
+// called through PostgREST, so the counter is shared by every Edge Function
+// replica instead of being per-instance. Falls back to the in-memory limiter
+// below when the service role / project URL are unavailable (local `deno run`)
+// or the shared limiter errors — best effort rather than failing open entirely.
+const RATE_LIMIT_MAX = 10; // max requests per window
 const RATE_LIMIT_WINDOW_MS = 60_000; // 1-minute rolling window
+const RATE_LIMIT_WINDOW_SECONDS = RATE_LIMIT_WINDOW_MS / 1000;
 
+/** In-memory fallback — per-instance, used only if the shared limiter is down. */
 type Bucket = { count: number; windowStart: number };
 const rateBuckets = new Map<string, Bucket>();
 
-function isRateLimited(ip: string): boolean {
+function isRateLimitedInMemory(key: string): boolean {
   const now = Date.now();
-  const bucket = rateBuckets.get(ip);
+  const bucket = rateBuckets.get(key);
   if (!bucket || now - bucket.windowStart > RATE_LIMIT_WINDOW_MS) {
-    rateBuckets.set(ip, { count: 1, windowStart: now });
+    rateBuckets.set(key, { count: 1, windowStart: now });
     return false;
   }
   bucket.count += 1;
   return bucket.count > RATE_LIMIT_MAX;
+}
+
+/** Pulls the first key out of the SUPABASE_SECRET_KEYS JSON dictionary. */
+function firstSecretKey(json: string | undefined): string | undefined {
+  if (!json) return undefined;
+  try {
+    const parsed: unknown = JSON.parse(json);
+    if (parsed && typeof parsed === 'object') {
+      const values = Object.values(parsed as Record<string, unknown>);
+      const first = values.find((value) => typeof value === 'string' && value.length > 0);
+      if (typeof first === 'string') return first;
+    }
+  } catch {
+    // Malformed dictionary — treat the shared limiter as unconfigured.
+  }
+  return undefined;
+}
+
+/**
+ * Resolves the project URL and a secret (service-role) key for the shared
+ * limiter. Supports both the legacy and the current API-key variables the
+ * platform injects. Returns null when they are not set (e.g. local `deno run`).
+ */
+function sharedRateLimiterConfig(): { url: string; secretKey: string } | null {
+  const url = Deno.env.get('SUPABASE_URL');
+  if (!url) return null;
+
+  const secretKey =
+    Deno.env.get('SUPABASE_SERVICE_ROLE_KEY') ??
+    Deno.env.get('SUPABASE_SECRET_KEY') ??
+    firstSecretKey(Deno.env.get('SUPABASE_SECRET_KEYS'));
+  if (!secretKey) return null;
+
+  return { url: url.replace(/\/+$/, ''), secretKey };
+}
+
+/** True when `key` has exceeded RATE_LIMIT_MAX requests in the current window. */
+async function isRateLimited(key: string): Promise<boolean> {
+  const config = sharedRateLimiterConfig();
+  if (!config) return isRateLimitedInMemory(key);
+
+  try {
+    const response = await fetch(`${config.url}/rest/v1/rpc/check_rate_limit`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        apikey: config.secretKey,
+        Authorization: `Bearer ${config.secretKey}`,
+      },
+      body: JSON.stringify({
+        p_key: key,
+        p_max: RATE_LIMIT_MAX,
+        p_window_seconds: RATE_LIMIT_WINDOW_SECONDS,
+      }),
+    });
+    if (!response.ok) throw new Error(`shared limiter returned ${response.status}`);
+    const allowed: unknown = await response.json();
+    if (typeof allowed !== 'boolean') throw new Error('shared limiter returned a non-boolean');
+    return !allowed;
+  } catch (err) {
+    console.warn(
+      '[analyze-meal] Shared rate limiter unavailable; using the in-memory fallback.',
+      err instanceof Error ? err.message : String(err)
+    );
+    return isRateLimitedInMemory(key);
+  }
 }
 
 // ── Resolution & aggregation ─────────────────────────────────────────────────
@@ -104,10 +202,10 @@ export function aggregate(resolved: ResolvedItem[]): NutritionResult {
 
 // ── Request handling ─────────────────────────────────────────────────────────
 
-function jsonResponse(body: unknown, status: number): Response {
+function jsonResponseWith(body: unknown, status: number, cors: Record<string, string>): Response {
   return new Response(JSON.stringify(body), {
     status,
-    headers: { 'Content-Type': 'application/json', ...corsHeaders },
+    headers: { 'Content-Type': 'application/json', ...cors },
   });
 }
 
@@ -159,8 +257,14 @@ export function extractImagePayload(body: Record<string, unknown>): { imageBase6
 }
 
 export async function handleRequest(req: Request): Promise<Response> {
+  const cors = corsHeadersFor(req);
+  // Responses carry the per-request CORS headers, so a disallowed browser origin
+  // never receives an Access-Control-Allow-Origin.
+  const jsonResponse = (body: unknown, status: number): Response =>
+    jsonResponseWith(body, status, cors);
+
   if (req.method === 'OPTIONS') {
-    return new Response(null, { status: 204, headers: corsHeaders });
+    return new Response(null, { status: 204, headers: cors });
   }
   if (req.method !== 'POST') {
     return jsonResponse({ error: { message: 'Method not allowed. Use POST.' } }, 405);
@@ -173,11 +277,24 @@ export async function handleRequest(req: Request): Promise<Response> {
     req.headers.get('cf-connecting-ip') ??
     req.headers.get('x-forwarded-for')?.split(',')[0].trim() ??
     'unknown';
-  if (isRateLimited(clientIp)) {
+  if (await isRateLimited(`analyze-meal:${clientIp}`)) {
     return jsonResponse(
       { error: { message: 'Too many requests. Please wait a moment and try again.' } },
       429
     );
+  }
+
+  // ── Caller authorization (defense in depth) ─────────────────────────────────
+  // `verify_jwt = true` (supabase/config.toml) rejects a missing, malformed or
+  // wrongly-signed Authorization header, but it also accepts publishable/secret
+  // API keys — which are not user sessions. Confirm the caller is a signed-in
+  // user before any work happens, so anonymous or key-only callers are rejected.
+  // https://supabase.com/docs/guides/functions/auth-headers
+  try {
+    authenticateRequest(req);
+  } catch (err) {
+    if (err instanceof ApiError) return jsonResponse({ error: { message: err.message } }, err.status);
+    return jsonResponse({ error: { message: 'Authentication failed.' } }, 401);
   }
 
   let payload: Record<string, unknown>;

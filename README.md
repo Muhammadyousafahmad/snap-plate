@@ -68,6 +68,17 @@ supabase secrets set GEMINI_API_KEY=... USDA_FDC_API_KEY=...
 supabase functions deploy analyze-meal
 ```
 
+### Edge Function security
+
+- **CORS** — the function reflects the request's `Origin` only when it is listed in the
+  `ALLOWED_ORIGINS` secret (comma-separated). Native requests send no `Origin` and are
+  unaffected, so set the web build's origin in production:
+  `supabase secrets set ALLOWED_ORIGINS=https://your-web-app.example.com`.
+- **Rate limiting** — requests are throttled (10/min per client) through a shared
+  `check_rate_limit` Postgres function, so the limit holds across every Edge Function
+  replica. The in-memory fallback runs only when the service-role key is unavailable
+  (local `deno run`).
+
 ## 🗂️ Project structure
 
 ```
