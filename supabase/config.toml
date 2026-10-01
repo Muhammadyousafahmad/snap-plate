@@ -1,0 +1,11 @@
+# ─── Supabase project configuration ──────────────────────────────────────────
+# Run `supabase link --project-ref <your-project-id>` to fill in project_id
+# with the real value (you'll find it in your Supabase dashboard, Settings > API).
+
+project_id = "zkfqjxctzfgyzrexarbg"
+
+# JWT verification is enforced — the mobile client must send the Supabase
+# anon key in the `apikey` header. This blocks unauthenticated API abuse
+# at the gateway layer before the function code is reached.
+[functions.analyze-meal]
+verify_jwt = true

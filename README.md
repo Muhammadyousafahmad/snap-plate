@@ -1,56 +1,130 @@
-# Welcome to your Expo app 👋
+# 📸 SnapPlate — AI Food Nutrition Scanner
 
-This is an [Expo](https://expo.dev) project created with [`create-expo-app`](https://www.npmjs.com/package/create-expo-app).
+**SnapPlate** is a camera-first mobile app built with **React Native (Expo)** and **Expo Router**.
+Snap a photo of your meal, and a multimodal AI instantly estimates its **calories, protein,
+carbs, and fat** — with an itemized breakdown of what was detected.
 
-## Get started
+> Built with NativeWind (Tailwind), Zustand, TanStack Query, Expo Camera, and a Supabase Edge
+> Function that pairs Gemini vision (identification only) with USDA FoodData Central (nutrition).
 
-1. Install dependencies
+## ✨ Features
 
-   ```bash
-   npm install
-   ```
+- 📷 **Live camera scanner** with a shutter button, camera flip, and a guided capture frame
+- 🖼️ **Gallery mode** — pick any meal photo from your library
+- 🤖 **AI analysis** through the `analyze-meal` backend: Gemini identifies the food items and
+  estimates portions, then USDA FoodData Central supplies the calories/macros (never the model)
+- 📊 Results screen: total calories, macro tiles, macro breakdown bars, and detected items
+- 💾 **Cached results** — the last scan is saved and shown on the home screen
+- 🌙 Sleek dark-mode UI styled with NativeWind (Tailwind CSS)
 
-2. Start the app
-
-   ```bash
-   npx expo start
-   ```
-
-In the output, you'll find options to open the app in a
-
-- [development build](https://docs.expo.dev/develop/development-builds/introduction/)
-- [Android emulator](https://docs.expo.dev/workflow/android-studio-emulator/)
-- [iOS simulator](https://docs.expo.dev/workflow/ios-simulator/)
-- [Expo Go](https://expo.dev/go), a limited sandbox for trying out app development with Expo
-
-You can start developing by editing the files inside the **app** directory. This project uses [file-based routing](https://docs.expo.dev/router/introduction).
-
-## Get a fresh project
-
-When you're ready, run:
+## 🚀 Getting started
 
 ```bash
-npm run reset-project
+npm install
+npx expo start
 ```
 
-This command will move the starter code to the **app-example** directory and create a blank **app** directory where you can start developing.
+Press `w` for web, `a` for Android, `i` for iOS, or scan the QR code with **Expo Go** on your phone.
 
-### Other setup steps
+## 🔑 Adding real AI analysis
 
-- To set up ESLint for linting, run `npx expo lint`, or follow our guide on ["Using ESLint and Prettier"](https://docs.expo.dev/guides/using-eslint/)
-- If you'd like to set up unit testing, follow our guide on ["Unit Testing with Jest"](https://docs.expo.dev/develop/unit-testing/)
-- Learn more about the TypeScript setup in this template in our guide on ["Using TypeScript"](https://docs.expo.dev/guides/typescript/)
+Nutrition numbers are computed by the **`analyze-meal` Edge Function** in
+[`supabase/functions/analyze-meal`](./supabase/functions/analyze-meal) — the app never calls an AI
+API directly and holds no API keys.
 
-## Learn more
+The function reads two secrets (`GEMINI_API_KEY`, `USDA_FDC_API_KEY`); see
+[`supabase/functions/analyze-meal/.env.example`](./supabase/functions/analyze-meal/.env.example).
 
-To learn more about developing your project with Expo, look at the following resources:
+### Run it locally (no Docker needed)
 
-- [Expo documentation](https://docs.expo.dev/): Learn fundamentals, or go into advanced topics with our [guides](https://docs.expo.dev/guides).
-- [Learn Expo tutorial](https://docs.expo.dev/tutorial/introduction/): Follow a step-by-step tutorial where you'll create a project that runs on Android, iOS, and the web.
+```bash
+# 1. Put the two real keys in supabase/functions/.env
+copy supabase\functions\analyze-meal\.env.example supabase\functions\.env
 
-## Join the community
+# 2. Start the function (binds 0.0.0.0:8000, so phones can reach it over the LAN)
+deno run --allow-net --allow-env --env-file=supabase/functions/.env supabase/functions/analyze-meal/index.ts
 
-Join our community of developers creating universal apps.
+# 3. Start the app
+npx expo start -c
+```
 
-- [Expo on GitHub](https://github.com/expo/expo): View our open source platform and contribute.
-- [Discord community](https://chat.expo.dev): Chat with Expo users and ask questions.
+**No URL configuration is required.** `src/services/ai.ts` derives the backend address from the
+Metro dev-server host the bundle was loaded from, so the same build works over Wi-Fi, a phone
+hotspot, an emulator, or the web — without editing `.env` when you change networks. Leave
+`EXPO_PUBLIC_API_URL` empty for that behaviour, or set it to override:
+
+```bash
+# .env  (optional override — e.g. once deployed)
+EXPO_PUBLIC_API_URL=https://<project-ref>.supabase.co/functions/v1/analyze-meal
+```
+
+If no server can be resolved (for example a production build with nothing configured), the app
+falls back to **Demo mode** so the UI always renders.
+
+### Deploy
+
+```bash
+supabase secrets set GEMINI_API_KEY=... USDA_FDC_API_KEY=...
+supabase functions deploy analyze-meal
+```
+
+## 🗂️ Project structure
+
+```
+src/
+├── app/
+│   ├── _layout.tsx     # Root layout (QueryClient + theme providers)
+│   ├── index.tsx       # Home screen ("Scan Meal" CTA + last scan)
+│   ├── scanner.tsx     # Live camera + gallery capture
+│   └── results.tsx     # Nutrition breakdown & detected items
+├── services/
+│   └── ai.ts           # AI service layer (backend/demo + NutritionResult types)
+├── store/
+│   └── nutrition-store.ts  # Zustand store (pending image, cached results)
+└── global.css          # Tailwind entry
+```
+
+## 🧠 API contract
+
+The app POSTs `{ "image_base64": "...", "mime_type": "image/jpeg" }` to the backend and expects
+`{ "result": NutritionResult }` back (or a non-2xx status with `{ "error": { "message": "..." } }`):
+
+```ts
+interface NutritionResult {
+  total_calories: number;
+  total_protein_g: number;
+  total_carbs_g: number;
+  total_fat_g: number;
+  items_detected: Array<{
+    name: string;
+    portion: string;      // human-readable, e.g. "150 g"
+    calories: number;
+    protein_g: number;
+    carbs_g?: number;
+    fat_g?: number;
+    original_grams?: number; // immutable Gemini estimate used for recalculation
+    calories_per_100g?: number;
+    protein_per_100g?: number;
+    carbs_per_100g?: number;
+    fat_per_100g?: number;
+    matched?: boolean;    // false when USDA had no good match (numbers are then 0)
+  }>;
+}
+```
+
+Inside the function the two AI concerns are deliberately separated:
+
+1. **Gemini** (vision) returns only `[{ name, estimated_grams }]` — it is explicitly instructed
+   never to invent calories or macros.
+2. **USDA FoodData Central** supplies the nutrition: per-100 g values are read by nutrient **ID**
+   (Energy `1008`, Protein `1003`, Carbohydrate `1005`, Fat `1004`) and scaled by `estimated_grams / 100`.
+
+## 🛠️ Commands
+
+| Command            | Description               |
+| ------------------ | ------------------------- |
+| `npm run start`    | Start the Expo dev server |
+| `npm run android`  | Start + open Android      |
+| `npm run ios`      | Start + open iOS simulator|
+| `npm run web`      | Start + open web          |
+| `npm run lint`     | Run ESLint                |
